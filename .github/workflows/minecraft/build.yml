@@ -1,0 +1,180 @@
+# Reusable workflow for building Minecraft Fabric mods.
+#
+# Handles:
+#   - Standard CI builds (push / pull_request)
+#   - Release builds: computes next semver tag scoped to the MC version,
+#     builds with that version, then creates a GitHub tag + release on success.
+#
+# Tag format: {minecraft_version}-v{mod_version}
+#   e.g.  1.21.11-v0.3.1   or   26.1-v1.2.0
+#
+# Version computation rules (driven by mod_version in gradle.properties):
+#   mod_version supplies minimum major.minor. The patch is always auto-incremented.
+#   - If no tags exist yet → use template version (patch = 0)
+#   - If latest tag major < template major → bump to template major, reset minor/patch
+#   - If latest tag minor < template minor (at current major) → bump to template minor, reset patch
+#   - Otherwise → increment patch
+
+name: Minecraft Mod Build
+
+on:
+  workflow_call:
+    inputs:
+      minecraft_version:
+        description: 'Minecraft version (e.g. 1.21.11 or 26.1)'
+        required: true
+        type: string
+      java_version:
+        description: 'Java version to build with'
+        required: true
+        type: string
+      create_release:
+        description: 'Compute next version, tag, and publish a GitHub release'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    outputs:
+      mod_version: ${{ steps.version.outputs.mod_version }}
+      tag:         ${{ steps.version.outputs.tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Full history + tags required for version computation
+          fetch-depth: 0
+
+      - name: Compute next release version
+        id: version
+        if: inputs.create_release
+        env:
+          MC_VERSION: ${{ inputs.minecraft_version }}
+        run: |
+          set -euo pipefail
+
+          # ── Read template from gradle.properties ─────────────────────────
+          TMPL=$(grep '^mod_version=' gradle.properties | cut -d= -f2 | tr -d '[:space:]')
+          TMPL_MAJOR=$(echo "$TMPL" | cut -d. -f1)
+          TMPL_MINOR=$(echo "$TMPL" | cut -d. -f2)
+
+          echo "Template version : ${TMPL} (major≥${TMPL_MAJOR}, minor≥${TMPL_MINOR})"
+
+          # ── Find latest existing tag for this MC version ──────────────────
+          PREFIX="${MC_VERSION}-v"
+
+          LATEST=$(git tag -l "${PREFIX}*" \
+            | sed "s|^${PREFIX}||" \
+            | sort -t. -k1,1n -k2,2n -k3,3n \
+            | tail -1)
+
+          echo "Latest tag suffix: ${LATEST:-<none>}"
+
+          # ── Compute next version ──────────────────────────────────────────
+          if [ -z "$LATEST" ]; then
+            NEW_VERSION="${TMPL_MAJOR}.${TMPL_MINOR}.0"
+          else
+            CUR_MAJOR=$(echo "$LATEST" | cut -d. -f1)
+            CUR_MINOR=$(echo "$LATEST" | cut -d. -f2)
+            CUR_PATCH=$(echo "$LATEST" | cut -d. -f3)
+
+            if [ "$TMPL_MAJOR" -gt "$CUR_MAJOR" ]; then
+              # Major floor raised — reset minor + patch
+              NEW_VERSION="${TMPL_MAJOR}.${TMPL_MINOR}.0"
+            elif [ "$TMPL_MINOR" -gt "$CUR_MINOR" ]; then
+              # Minor floor raised (within same major) — reset patch
+              NEW_VERSION="${CUR_MAJOR}.${TMPL_MINOR}.0"
+            else
+              # Same major.minor — increment patch
+              NEW_PATCH=$(( CUR_PATCH + 1 ))
+              NEW_VERSION="${CUR_MAJOR}.${CUR_MINOR}.${NEW_PATCH}"
+            fi
+          fi
+
+          TAG="${PREFIX}${NEW_VERSION}"
+          echo "New version : ${NEW_VERSION}"
+          echo "New tag     : ${TAG}"
+
+          echo "mod_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"                 >> "$GITHUB_OUTPUT"
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Set up JDK ${{ inputs.java_version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: 'microsoft'
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Build
+        run: |
+          MOD_VERSION="${{ steps.version.outputs.mod_version }}"
+          if [ -n "$MOD_VERSION" ]; then
+            echo "Building with overridden mod_version=${MOD_VERSION}"
+            ./gradlew build -Pmod_version="$MOD_VERSION"
+          else
+            ./gradlew build
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Artifacts
+          path: build/libs/
+
+  release:
+    name: Tag & Release
+    runs-on: ubuntu-24.04
+    needs: build
+    # Only run when a release was requested AND the build succeeded
+    if: inputs.create_release && needs.build.result == 'success'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: Artifacts
+          path: build/libs/
+
+      - name: Create git tag
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN:    ${{ github.token }}
+          TAG:         ${{ needs.build.outputs.tag }}
+          MOD_VERSION: ${{ needs.build.outputs.mod_version }}
+          MC_VERSION:  ${{ inputs.minecraft_version }}
+        run: |
+          gh release create "$TAG" build/libs/*.jar \
+            --title "v${MOD_VERSION} — Minecraft ${MC_VERSION}" \
+            --notes "$(cat <<EOF
+          ## Points of Interest — v${MOD_VERSION}
+
+          **Minecraft version:** ${MC_VERSION}
+
+          ---
+          EOF
+          )" \
+            --generate-notes
