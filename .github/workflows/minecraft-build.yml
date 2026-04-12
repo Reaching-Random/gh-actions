@@ -169,11 +169,12 @@ jobs:
           TAG:         ${{ needs.build.outputs.tag }}
           MOD_VERSION: ${{ needs.build.outputs.mod_version }}
           MC_VERSION:  ${{ inputs.minecraft_version }}
+          REPO_NAME:   ${{ github.event.repository.name }}
         run: |
           gh release create "$TAG" build/libs/*.jar \
             --title "v${MOD_VERSION} — Minecraft ${MC_VERSION}" \
             --notes "$(cat <<EOF
-          ## Points of Interest — v${MOD_VERSION}
+          ## ${REPO_NAME} — v${MOD_VERSION}
 
           **Minecraft version:** ${MC_VERSION}
 
