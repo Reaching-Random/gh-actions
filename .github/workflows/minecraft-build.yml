@@ -36,14 +36,19 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      gemini_api_key:
+        description: 'Gemini API key for generating release notes'
+        required: false
 
 jobs:
   build:
     name: Build
     runs-on: ubuntu-24.04
     outputs:
-      mod_version: ${{ steps.version.outputs.mod_version }}
-      tag:         ${{ steps.version.outputs.tag }}
+      mod_version:  ${{ steps.version.outputs.mod_version }}
+      tag:          ${{ steps.version.outputs.tag }}
+      previous_tag: ${{ steps.version.outputs.previous_tag }}
 
     steps:
       - name: Checkout repository
@@ -80,7 +85,9 @@ jobs:
           # ── Compute next version ──────────────────────────────────────────
           if [ -z "$LATEST" ]; then
             NEW_VERSION="${TMPL_MAJOR}.${TMPL_MINOR}.0"
+            PREVIOUS_TAG=""
           else
+            PREVIOUS_TAG="${PREFIX}${LATEST}"
             CUR_MAJOR=$(echo "$LATEST" | cut -d. -f1)
             CUR_MINOR=$(echo "$LATEST" | cut -d. -f2)
             CUR_PATCH=$(echo "$LATEST" | cut -d. -f3)
@@ -104,6 +111,7 @@ jobs:
 
           echo "mod_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}"                 >> "$GITHUB_OUTPUT"
+          echo "previous_tag=${PREVIOUS_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Validate Gradle wrapper
         uses: gradle/actions/wrapper-validation@v6
@@ -163,6 +171,75 @@ jobs:
           git tag "$TAG"
           git push origin "$TAG"
 
+      - name: Generate release notes
+        env:
+          GEMINI_API_KEY: ${{ secrets.gemini_api_key }}
+          PREVIOUS_TAG:   ${{ needs.build.outputs.previous_tag }}
+        run: |
+          set -e -E
+          
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "GEMINI_API_KEY is not set, skipping AI generation."
+            exit 0
+          fi
+          
+          MODEL_ID="gemini-3.1-flash-lite-preview"
+          GENERATE_CONTENT_API="generateContent"
+          
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "First release detected. Fetching all commits."
+            COMMITS=$(git log HEAD --no-merges --pretty=format:'%s%n%b')
+          else
+            echo "Fetching commits from ${PREVIOUS_TAG} to HEAD."
+            COMMITS=$(git log "${PREVIOUS_TAG}..HEAD" --no-merges --pretty=format:'%s%n%b')
+          fi
+          
+          if [ -z "$COMMITS" ]; then
+            echo "No commits found to summarize."
+            exit 0
+          fi
+          
+          PROMPT="You are a release assistant that summarizes Git commit histories into clear, human-readable release notes.
+
+          Guidelines:
+          - Write the first line as a succinct one-sentence title (for example, ‘Adds retry logic and job fix’), then include a blank line followed by formatted release notes.
+          - Group related changes together under headers (✨ Features, 🐛 Fixes, 🧹 Maintenance).
+          - Ignore trivial commits like version bumps or formatting.
+          - Be concise and professional (5–10 short bullet points max).
+          - Do not include commit hashes, author names, or dates.
+          - Do not include any other detail than the summary (e.g., no 'here's the summary'). The only output should be the markdown that will be used as the tag comment.
+
+          Now summarize the following commit history:
+          ---
+          $COMMITS
+          ---"
+          
+          RESPONSE=$(jq -n --arg text "$PROMPT" '{
+            contents: [{role: "user", parts: [{text: $text}]}],
+            generationConfig: {temperature: 0.7}
+          }' | curl -s -X POST \
+            -H "Content-Type: application/json" \
+            "https://generativelanguage.googleapis.com/v1beta/models/${MODEL_ID}:${GENERATE_CONTENT_API}?key=${GEMINI_API_KEY}" \
+            -d @-)
+          
+          if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+            echo "❌ Invalid JSON response from Gemini API:"
+            echo "$RESPONSE"
+            exit 1
+          fi
+          
+          SUMMARY=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // empty')
+          
+          if [ -z "$SUMMARY" ]; then
+            echo "❌ No summary text returned. Full response:"
+            echo "$RESPONSE"
+            # Proceed without creating the release notes file.
+            exit 0
+          fi
+          
+          echo "$SUMMARY" > release_notes.md
+          echo "Generated AI release notes successfully."
+
       - name: Create GitHub release
         env:
           GH_TOKEN:    ${{ github.token }}
@@ -171,14 +248,30 @@ jobs:
           MC_VERSION:  ${{ inputs.minecraft_version }}
           REPO_NAME:   ${{ github.event.repository.name }}
         run: |
-          gh release create "$TAG" build/libs/*.jar \
-            --title "v${MOD_VERSION} — Minecraft ${MC_VERSION}" \
-            --notes "$(cat <<EOF
+          NOTES_CONTENT=$(cat <<EOF
           ## ${REPO_NAME} — v${MOD_VERSION}
-
+          
           **Minecraft version:** ${MC_VERSION}
-
+          
           ---
+          
           EOF
-          )" \
-            --generate-notes
+          )
+          
+          # Clean up the leading whitespace from the EOF block
+          NOTES_CONTENT=$(echo -e "\n$NOTES_CONTENT" | sed -E 's/^[[:space:]]+//')
+
+          if [ -f release_notes.md ]; then
+            echo "$NOTES_CONTENT" > final_notes.md
+            cat release_notes.md >> final_notes.md
+            
+            gh release create "$TAG" build/libs/*.jar \
+              --title "v${MOD_VERSION} — Minecraft ${MC_VERSION}" \
+              --notes-file final_notes.md
+          else
+            echo "$NOTES_CONTENT" > final_notes.md
+            gh release create "$TAG" build/libs/*.jar \
+              --title "v${MOD_VERSION} — Minecraft ${MC_VERSION}" \
+              --notes-file final_notes.md \
+              --generate-notes
+          fi
