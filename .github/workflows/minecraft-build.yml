@@ -183,7 +183,7 @@ jobs:
             exit 0
           fi
           
-          MODEL_ID="gemini-3.1-flash-lite-preview"
+          MODEL_ID="gemini-3.1-flash-lite"
           GENERATE_CONTENT_API="generateContent"
           
           if [ -z "$PREVIOUS_TAG" ]; then
