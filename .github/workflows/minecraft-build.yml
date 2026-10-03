@@ -38,6 +38,26 @@ on:
         required: false
         type: boolean
         default: false
+      modrinth_version_type:
+        description: 'Modrinth release channel: release, beta or alpha'
+        required: false
+        type: string
+        default: 'release'
+      modrinth_dependencies:
+        description: 'One Modrinth dependency per line: "<slug or project id> <required|optional|incompatible|embedded>"'
+        required: false
+        type: string
+        default: 'fabric-api required'
+      modrinth_loaders:
+        description: 'Space-separated Modrinth loaders (e.g. "fabric quilt")'
+        required: false
+        type: string
+        default: 'fabric'
+      modrinth_game_versions:
+        description: 'Space-separated Minecraft versions the jar supports. Defaults to minecraft_version'
+        required: false
+        type: string
+        default: ''
     secrets:
       gemini_api_key:
         description: 'Gemini API key for generating release notes'
@@ -291,8 +311,13 @@ jobs:
           TAG:            ${{ needs.build.outputs.tag }}
           MOD_VERSION:    ${{ needs.build.outputs.mod_version }}
           MC_VERSION:     ${{ inputs.minecraft_version }}
+          VERSION_TYPE:   ${{ inputs.modrinth_version_type }}
+          DEPENDENCIES:   ${{ inputs.modrinth_dependencies }}
+          LOADERS:        ${{ inputs.modrinth_loaders }}
+          GAME_VERSIONS:  ${{ inputs.modrinth_game_versions || inputs.minecraft_version }}
         run: |
           set -euo pipefail
+          UA="User-Agent: ${GITHUB_REPOSITORY}/${MOD_VERSION} (github-actions)"
 
           if [ -z "$MODRINTH_TOKEN" ]; then
             echo "❌ MODRINTH_PROJECT_ID is set but the MODRINTH_TOKEN secret is missing."
@@ -307,31 +332,53 @@ jobs:
           CHANGELOG=$(printf '%s\n' "$BODY" | awk 'found{print} /^---$/{found=1}')
           [ -n "$CHANGELOG" ] || CHANGELOG="$BODY"
 
-          # P7dR8mSH = Fabric API
+          case "$VERSION_TYPE" in
+            release|beta|alpha) ;;
+            *) echo "❌ modrinth_version_type must be release, beta or alpha (got '${VERSION_TYPE}')"; exit 1 ;;
+          esac
+
+          # Resolve each "<slug or id> <type>" line to {project_id, dependency_type}.
+          DEPS='[]'
+          while read -r DEP_PROJECT DEP_TYPE _; do
+            [ -n "$DEP_PROJECT" ] || continue
+            case "$DEP_TYPE" in
+              required|optional|incompatible|embedded) ;;
+              *) echo "❌ Dependency '${DEP_PROJECT}' needs a type of required, optional, incompatible or embedded"; exit 1 ;;
+            esac
+            DEP_ID=$(curl -sSf -H "$UA" "https://api.modrinth.com/v2/project/${DEP_PROJECT}" | jq -r .id) \
+              || { echo "❌ Modrinth project '${DEP_PROJECT}' not found"; exit 1; }
+            echo "Dependency: ${DEP_PROJECT} (${DEP_ID}) ${DEP_TYPE}"
+            DEPS=$(jq -c --arg id "$DEP_ID" --arg t "$DEP_TYPE" '. + [{project_id: $id, dependency_type: $t}]' <<< "$DEPS")
+          done <<< "$DEPENDENCIES"
+
           jq -n \
             --arg project_id "$PROJECT_ID" \
             --arg name "v${MOD_VERSION} — Minecraft ${MC_VERSION}" \
             --arg version_number "${MOD_VERSION}+${MC_VERSION}" \
             --arg changelog "$CHANGELOG" \
-            --arg mc "$MC_VERSION" \
+            --arg game_versions "$GAME_VERSIONS" \
+            --arg loaders "$LOADERS" \
+            --arg version_type "$VERSION_TYPE" \
+            --argjson dependencies "$DEPS" \
             '{
               project_id: $project_id,
               name: $name,
               version_number: $version_number,
               changelog: $changelog,
-              game_versions: [$mc],
-              loaders: ["fabric"],
-              version_type: "release",
+              game_versions: ($game_versions | split(" ") | map(select(. != ""))),
+              loaders: ($loaders | split(" ") | map(select(. != ""))),
+              version_type: $version_type,
               featured: false,
-              dependencies: [{project_id: "P7dR8mSH", dependency_type: "required"}],
+              dependencies: $dependencies,
               file_parts: ["jar"],
               primary_file: "jar"
             }' > modrinth.json
+          cat modrinth.json | jq 'del(.changelog)'
 
           HTTP=$(curl -sS -o response.json -w '%{http_code}' \
             -X POST https://api.modrinth.com/v2/version \
             -H "Authorization: ${MODRINTH_TOKEN}" \
-            -H "User-Agent: ${GITHUB_REPOSITORY}/${MOD_VERSION} (github-actions)" \
+            -H "$UA" \
             -F "data=<modrinth.json;type=application/json" \
             -F "jar=@${JAR};type=application/java-archive")
 
