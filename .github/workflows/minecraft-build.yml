@@ -4,6 +4,8 @@
 #   - Standard CI builds (push / pull_request)
 #   - Release builds: computes next semver tag scoped to the MC version,
 #     builds with that version, then creates a GitHub tag + release on success.
+#   - Modrinth: release builds also upload the jar as a Modrinth version when the
+#     calling repo has a MODRINTH_PROJECT_ID variable and a MODRINTH_TOKEN secret.
 #
 # Tag format: {minecraft_version}-v{mod_version}
 #   e.g.  1.21.11-v0.3.1   or   26.1-v1.2.0
@@ -39,6 +41,9 @@ on:
     secrets:
       gemini_api_key:
         description: 'Gemini API key for generating release notes'
+        required: false
+      modrinth_token:
+        description: 'Modrinth PAT (scope: Create versions). Publishing also needs the MODRINTH_PROJECT_ID repo variable'
         required: false
 
 jobs:
@@ -275,3 +280,64 @@ jobs:
               --notes-file final_notes.md \
               --generate-notes
           fi
+
+      # Skipped unless the calling repo sets the MODRINTH_PROJECT_ID variable.
+      - name: Publish to Modrinth
+        if: vars.MODRINTH_PROJECT_ID != ''
+        env:
+          GH_TOKEN:       ${{ github.token }}
+          MODRINTH_TOKEN: ${{ secrets.modrinth_token }}
+          PROJECT_ID:     ${{ vars.MODRINTH_PROJECT_ID }}
+          TAG:            ${{ needs.build.outputs.tag }}
+          MOD_VERSION:    ${{ needs.build.outputs.mod_version }}
+          MC_VERSION:     ${{ inputs.minecraft_version }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$MODRINTH_TOKEN" ]; then
+            echo "❌ MODRINTH_PROJECT_ID is set but the MODRINTH_TOKEN secret is missing."
+            exit 1
+          fi
+
+          JAR=$(ls build/libs/*.jar | grep -v -- '-sources\.jar$' | head -1)
+          echo "Uploading ${JAR}"
+
+          # Reuse the GitHub release notes, minus the header above the first '---'.
+          BODY=$(gh release view "$TAG" --json body -q .body)
+          CHANGELOG=$(printf '%s\n' "$BODY" | awk 'found{print} /^---$/{found=1}')
+          [ -n "$CHANGELOG" ] || CHANGELOG="$BODY"
+
+          # P7dR8mSH = Fabric API
+          jq -n \
+            --arg project_id "$PROJECT_ID" \
+            --arg name "v${MOD_VERSION} — Minecraft ${MC_VERSION}" \
+            --arg version_number "${MOD_VERSION}+${MC_VERSION}" \
+            --arg changelog "$CHANGELOG" \
+            --arg mc "$MC_VERSION" \
+            '{
+              project_id: $project_id,
+              name: $name,
+              version_number: $version_number,
+              changelog: $changelog,
+              game_versions: [$mc],
+              loaders: ["fabric"],
+              version_type: "release",
+              featured: false,
+              dependencies: [{project_id: "P7dR8mSH", dependency_type: "required"}],
+              file_parts: ["jar"],
+              primary_file: "jar"
+            }' > modrinth.json
+
+          HTTP=$(curl -sS -o response.json -w '%{http_code}' \
+            -X POST https://api.modrinth.com/v2/version \
+            -H "Authorization: ${MODRINTH_TOKEN}" \
+            -H "User-Agent: ${GITHUB_REPOSITORY}/${MOD_VERSION} (github-actions)" \
+            -F "data=<modrinth.json;type=application/json" \
+            -F "jar=@${JAR};type=application/java-archive")
+
+          if [ "$HTTP" != "200" ]; then
+            echo "❌ Modrinth upload failed (HTTP ${HTTP}):"
+            cat response.json
+            exit 1
+          fi
+          echo "✅ Published https://modrinth.com/mod/${PROJECT_ID}/version/$(jq -r .id response.json)"
